@@ -84,6 +84,14 @@ private:
 	void ReleaseImage();
 	CProcessParams MakeProcessParams() const;
 
+	// --- animation timing -------------------------------------------------
+	// Same scheduling model upstream uses: the next frame is armed from an absolute "expected tick"
+	// and the drift so far is subtracted from the wait, so a quantised WM_TIMER does not make the
+	// whole animation slower than the file (or a browser) asks for.
+	void StartAnimationTimer();
+	void AdjustAnimationTimer();
+	void StopAnimationTimer();
+
 	// geometry helpers
 	CSize ComputeVirtualSize(const CRect& clientRect) const;
 
@@ -155,6 +163,10 @@ private:
 	// Caption / taskbar / Alt+Tab icons, taken from the embedded IDR_MAINFRAME resource.
 	HICON m_hIconBig;
 	HICON m_hIconSmall;
+
+	// Animation scheduling, mirroring upstream: expected tick for the next frame plus accumulated drift.
+	int m_nAnimationOffset;
+	DWORD m_nAnimationExpectedTick;
 
 	bool m_bConfigMaximized;
 	COLORREF m_clrConfigBackground;

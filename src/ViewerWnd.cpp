@@ -94,6 +94,8 @@ CViewerWnd::CViewerWnd()
 	, m_hErrorFont(NULL)
 	, m_hIconBig(NULL)
 	, m_hIconSmall(NULL)
+	, m_nAnimationOffset(0)
+	, m_nAnimationExpectedTick(0)
 	, m_bConfigMaximized(false)
 	, m_clrConfigBackground(RGB(32, 32, 32))
 	, m_bStartupDone(false)
@@ -806,6 +808,11 @@ LRESULT CViewerWnd::OnTimer(UINT, WPARAM wParam, LPARAM, BOOL& /*bHandled*/) {
 		if (nFrames > 1) {
 			int nNext = (m_pImage->FrameIndex() + 1) % nFrames;
 			RequestFrame(nNext);
+			// Upstream paints the new frame before re-arming, so the frame's own display time starts
+			// when the pixels are actually on screen. Every frame carries its own delay (GIF per-frame
+			// GCE, WebP per-frame duration, APNG fcTL), so the wait is recomputed from that frame.
+			UpdateWindow();
+			AdjustAnimationTimer();
 		}
 	}
 	if ((int)wParam == HQ_REFINE_TIMER_ID) {
@@ -859,7 +866,7 @@ LRESULT CViewerWnd::OnImageLoadCompleted(UINT, WPARAM wParam, LPARAM, BOOL& /*bH
 
 LRESULT CViewerWnd::OnClose(UINT, WPARAM, LPARAM, BOOL& /*bHandled*/) {
 	SaveConfig();
-	KillTimer(ANIMATION_TIMER_ID);
+	StopAnimationTimer();
 	DestroyWindow();
 	::PostQuitMessage(0);
 	return 0;
@@ -914,9 +921,9 @@ void CViewerWnd::RequestCurrentImage() {
 	m_bLoadError = (pImage == NULL);
 	UpdateTitle();
 
-	KillTimer(ANIMATION_TIMER_ID);
-	if (m_pImage != NULL && m_pImage->IsAnimation() && m_pImage->NumberOfFrames() > 1) {
-		SetTimer(ANIMATION_TIMER_ID, max(20, m_pImage->FrameTimeMs()), NULL);
+	StopAnimationTimer();
+	if (m_pImage != NULL) {
+		StartAnimationTimer();
 	}
 	Invalidate(FALSE);
 }
@@ -934,6 +941,39 @@ void CViewerWnd::RequestFrame(int nFrameIndex) {
 	}
 }
 
+void CViewerWnd::StartAnimationTimer() {
+	if (m_pImage == NULL || !m_pImage->IsAnimation() || m_pImage->NumberOfFrames() <= 1) {
+		StopAnimationTimer();
+		return;
+	}
+	int nFrameTime = max(10, m_pImage->FrameTimeMs());
+	SetTimer(ANIMATION_TIMER_ID, (UINT)nFrameTime, NULL);
+	m_nAnimationOffset = 0;
+	m_nAnimationExpectedTick = ::GetTickCount() + nFrameTime;
+}
+
+void CViewerWnd::AdjustAnimationTimer() {
+	// Scheduling model copied from upstream: the next frame is due at an absolute tick, and whatever
+	// the timer system was late by is subtracted from the following wait (never below 10 ms), so the
+	// 15.6 ms WM_TIMER quantisation cannot accumulate into a permanent slowdown.
+	if (m_pImage == NULL || !m_pImage->IsAnimation() || m_pImage->NumberOfFrames() <= 1) {
+		StopAnimationTimer();
+		return;
+	}
+	KillTimer(ANIMATION_TIMER_ID);
+	m_nAnimationOffset += (int)(::GetTickCount() - m_nAnimationExpectedTick);
+	m_nAnimationOffset = min(m_nAnimationOffset, max(100, m_pImage->FrameTimeMs()));
+	int nFrameTime = max(10, m_pImage->FrameTimeMs() - max(0, m_nAnimationOffset));
+	m_nAnimationExpectedTick = ::GetTickCount() + max(10, m_pImage->FrameTimeMs());
+	SetTimer(ANIMATION_TIMER_ID, (UINT)nFrameTime, NULL);
+}
+
+void CViewerWnd::StopAnimationTimer() {
+	KillTimer(ANIMATION_TIMER_ID);
+	m_nAnimationOffset = 0;
+	m_nAnimationExpectedTick = 0;
+}
+
 void CViewerWnd::GoToPath(LPCTSTR sPath) {
 	if (sPath == NULL || *sPath == 0) {
 		return;
@@ -945,7 +985,7 @@ void CViewerWnd::GoToPath(LPCTSTR sPath) {
 	if (!bIsDirectory && !CFileList::IsSupportedFile(sPath)) {
 		// No message box: the window itself states that the file cannot be read.
 		ReleaseImage();
-		KillTimer(ANIMATION_TIMER_ID);
+		StopAnimationTimer();
 		SetWindowText(CString(_T(ImageBrowser_TITLE)));
 		m_bLoadError = true;
 		Invalidate(FALSE);
@@ -956,7 +996,7 @@ void CViewerWnd::GoToPath(LPCTSTR sPath) {
 	}
 
 	ReleaseImage();
-	KillTimer(ANIMATION_TIMER_ID);
+	StopAnimationTimer();
 	delete m_pFileList;
 	m_pFileList = new CFileList(CString(sPath), *m_pWatcher, Helpers::FS_FileName, true, false);
 	if (m_pFileList == NULL || m_pFileList->Size() == 0) {
@@ -986,7 +1026,7 @@ void CViewerWnd::StepFile(bool bForward) {
 	}
 
 	ReleaseImage();
-	KillTimer(ANIMATION_TIMER_ID);
+	StopAnimationTimer();
 	if (bForward) {
 		m_pFileList->Next();
 	} else {
