@@ -1,0 +1,2 @@
+// exe 与窗口图标：资源 ID 固定为 1，ImageBrowser.cpp 用 MAKEINTRESOURCEW(1) 读取。
+1 ICON "ImageBrowser.ico"

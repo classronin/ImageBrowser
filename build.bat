@@ -1,62 +1,49 @@
 @echo off
-rem ============================================================================
-rem  ImageBrowser - ClassRonin : build script
-rem  Usage:
-rem      build.bat              -> Release x64, incremental
-rem      build.bat debug        -> Debug   x64, incremental
-rem      build.bat release clean-> Release x64, full rebuild
-rem  Output: bin\x64\<Configuration>\ImageBrowser.exe  (+ ImageBrowser.ini at runtime)
-rem  Requirements: Visual Studio 2022 with the "Desktop development with C++"
-rem  workload (v143 toolset, Windows 10/11 SDK). No NuGet, no external deps:
-rem  every third-party library is a static .lib already inside third_party\.
-rem ============================================================================
-setlocal EnableExtensions
-
-set "CONFIG=Release"
-set "ACTION=Build"
-
-:parse
-if "%~1"=="" goto parsed
-if /i "%~1"=="debug"   ( set "CONFIG=Debug"   & shift & goto parse )
-if /i "%~1"=="release" ( set "CONFIG=Release" & shift & goto parse )
-if /i "%~1"=="clean"   ( set "ACTION=Rebuild" & shift & goto parse )
-if /i "%~1"=="rebuild" ( set "ACTION=Rebuild" & shift & goto parse )
-echo Unknown argument: %~1
-echo Usage: build.bat [debug^|release] [clean]
-exit /b 2
-:parsed
-
+chcp 65001 >nul
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-rem ---- locate MSBuild -------------------------------------------------------
-set "MSBUILD="
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -prerelease -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do set "MSBUILD=%%i"
-if not defined MSBUILD if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=%ProgramFiles%\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
-if not defined MSBUILD if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=%ProgramFiles%\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"
-if not defined MSBUILD if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
-
-if not defined MSBUILD (
-	echo [error] MSBuild.exe not found. Install Visual Studio 2022 with "Desktop development with C++".
-	exit /b 1
-)
-
-echo [info] MSBuild : %MSBUILD%
-echo [info] Config  : %CONFIG% ^| x64
-echo [info] Action  : %ACTION%
+echo === ImageBrowser 编译 ===
+echo 源码目录: %CD%
 echo.
 
-"%MSBUILD%" ImageBrowser.sln /t:%ACTION% /p:Configuration=%CONFIG% /p:Platform=x64 /m /v:m /nologo
+where cmake >nul 2>nul
 if errorlevel 1 (
-	echo.
-	echo [error] build failed.
-	exit /b 1
+    echo [错误] 找不到 cmake，请先安装 CMake 并把它加进 PATH。
+    goto :fail
 )
 
-set "EXE=bin\x64\%CONFIG%\ImageBrowser.exe"
-if not exist "%EXE%" (
-	echo [error] expected output missing: %EXE%
-	exit /b 1
+if not exist "build\CMakeCache.txt" (
+    echo [1/2] 配置工程 - Visual Studio 17 2022 x64
+    cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+    if errorlevel 1 goto :fail
+) else (
+    echo [1/2] 已有 build 目录，跳过配置
 )
-for %%f in ("%EXE%") do echo [done] %%f  ^(%%~zf bytes^)
+
+echo.
+echo [2/2] 编译 Release
+cmake --build build --config Release
+if errorlevel 1 goto :fail
+
+if not exist "build\Release\ImageBrowser.exe" (
+    echo [错误] 没找到 build\Release\ImageBrowser.exe
+    goto :fail
+)
+
+copy /y "build\Release\ImageBrowser.exe" "ImageBrowser.exe" >nul
+echo.
+echo === 完成 ===
+echo 输出: %CD%\ImageBrowser.exe
+for %%A in ("ImageBrowser.exe") do echo 大小: %%~zA 字节
+goto :done
+
+:fail
+echo.
+echo [失败] 编译没有完成，请看上面的输出。
+pause
+exit /b 1
+
+:done
+pause
 exit /b 0
