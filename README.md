@@ -2,13 +2,12 @@
 
 从 [jpegview](https://github.com/sylikc/jpegview) 中移除不常用，做个精简（去掉JXL/HEIF/AVIF/RAW）的图像浏览器。
 
+---
 
 下载：[ImageBrowser.zip](ImageBrowser.zip)
 
+---
 
-
-- 标题：ImageBrowser - ClassRonin
-- 文件名：ImageBrowser.exe
 - 配置名：ImageBrowser.ini（与exe同级目录）
 - ini 配置：保存最大化窗口、底色、背景模式（alpha/color）（仅限关闭exe写入ini）。
 - Tab 键：背景在"透明棋盘格"与"纯色底"之间切换，默认棋盘格 
@@ -23,6 +22,6 @@
 - ESC / CTRL+W 键：关闭exe
 - CTRL + 滚动：缩放2倍率（ini配置可以修改）
 
-
+---
 
 ![ImageBrowser](Screenshot.webp)
