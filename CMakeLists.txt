@@ -63,7 +63,6 @@ target_include_directories(ImageBrowser PRIVATE
   ${JPEGVIEW_DIR}/libpng-apng/include
   ${JPEGVIEW_DIR}/libwebp/include
   ${JPEGVIEW_DIR}/qoi
-  ${JPEGVIEW_DIR}/libheif/include
   E:/Programs/vcpkg/installed/x64-windows-static/include
   ${ATL_INCLUDE}
 )

@@ -101,14 +101,13 @@ namespace Helpers {
 	CString SystemTimeToString(const SYSTEMTIME &time);
 
 	// pixel is ARGB, backgroundColor is BGR. Returns ARGB
-	// ImageBrowser 改动：内核原版会把 alpha 提前烘到底色上（输出不透明），
-	// 而本壳需要自己按 Tab 在棋盘/纯色底之间切换，所以这里保留直通 alpha。
+	// ImageBrowser 改动：本壳用分层窗口（UpdateLayeredWindow）做逐像素真透明，
+	// 需要原样保留 alpha，所以这里直通、不在载入时把 alpha 烘进底色。
 	static inline uint32 AlphaBlendBackground(uint32 pixel, COLORREF backgroundColor)
 	{
 		(void)backgroundColor;
 		return pixel;
 	}
-
 	// Gets the image size to be used when fitting the image to screen, either using 'fit to screen'
 	// or 'fill with crop' method. If 'fill with crop' is used, the bLimitAR can be set to avoid
 	// filling when to less pixels remain visible

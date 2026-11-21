@@ -140,6 +140,7 @@ private:
     // 这三件套就是原版“按住方向键顺滑、CPU 低”的原因：请求是阻塞的、结果有 2 个缓冲的
     // 预读缓存、过期请求会被 RemoveUnusedImages 回收——不是每按一下新起一个解码。
     void ShowImage(CJPEGProvider::EReadAheadDirection dir, int frame = 0, bool newImage = true);
+    void OpenPath(const std::wstring& path);
     void StepFile(int delta);
     void DeleteCurrentFile();
     std::wstring CurrentPath() const;
@@ -155,10 +156,12 @@ private:
     void Paint();
     void ComputeLayout(CSize& full, CSize& clip, CPoint& targetOffset, CPoint& drawPos);
     HBRUSH BackgroundBrush();
-    void FillBackgroundArea(HDC dc, int x, int y, int w, int h);
+    COLORREF BackgroundColor() const;
     bool EnsureSurface(int w, int h);
     void ReleaseSurface();
-    void BlendToSurface(const BYTE* src, int sw, int sh, int dx, int dy);
+    void ClearSurface();
+    void BlendToSurface(const BYTE* src, int stride, int sw, int sh, int dx, int dy);
+    void FillBackgroundArea(HDC dc, int x, int y, int w, int h);
 
     // 交互
     void ToggleFit();
@@ -210,22 +213,16 @@ private:
     bool interacting_ = false;
     bool zooming_ = false;
 
-    // 4 通道原图也可能整张不透明（PNG 常见）：加载后第一次绘制时扫一遍 alpha 定下来，
-    // 之后每帧就能走不透明的直贴路径，不用逐像素合成。
-    bool alphaChecked_ = false;
-    bool imageHasAlpha_ = false;
+    // 背景画刷（纯色）
+    HBRUSH solidBrush_ = nullptr;
+    COLORREF solidColor_ = 0xFFFFFFFF;
 
-    // 绘制面：自管 DIB 段 + 内存 DC，全走 GDI（GDI+ 每帧整窗 alpha 混合要 17ms）
+    // 分层窗口的绘制面：32bpp 自管 DIB，alpha 直接就是窗口的透明度
     HDC memDC_ = nullptr;
     HBITMAP surfaceBmp_ = nullptr;
     HBITMAP oldSurfaceBmp_ = nullptr;
     void* surfaceBits_ = nullptr;
     int surfaceW_ = 0, surfaceH_ = 0;
-
-
-    HBRUSH checkerBrush_ = nullptr;
-    HBRUSH solidBrush_ = nullptr;
-    COLORREF solidColor_ = 0xFFFFFFFF;
 
     static const UINT kSettleTimerId = 2;
     static const UINT kZoomTextTimerId = 3;
@@ -355,20 +352,35 @@ bool CImageBrowserApp::Create(HINSTANCE hInst, const std::wstring& startupFile) 
         ReleaseDC(hwnd_, dc);
     }
 
-    if (!startupFile.empty()) {
-        wchar_t full[MAX_PATH] = {0};
-        if (GetFullPathNameW(startupFile.c_str(), MAX_PATH, full, nullptr)) {
-            CString path(full);
-            DWORD attr = GetFileAttributesW(full);
-            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) path += _T("\\");
-            // 字母序（FS_FileName）+ 升序，与“←→ 按字母序切图”一致
-            fileList_ = new CFileList(path, *watcher_, Helpers::FS_FileName, true, true);
-            fileList_->SetNavigationMode(Helpers::NM_LoopDirectory);
-            ShowImage(CJPEGProvider::FORWARD);
-        }
-    }
+    if (!startupFile.empty()) OpenPath(startupFile);
     if (!fileList_) UpdateTitle();
+    DragAcceptFiles(hwnd_, TRUE);   // 允许把文件/文件夹拖进窗口打开
     return true;
+}
+
+// 打开一个文件或目录（命令行参数、拖放共用）。和 IDM_MOVE_TO_RECYCLE_BIN 一样，
+// 先把自己手里的图交还给 provider，再清空请求、换掉 CFileList，避免旧请求继续写内存。
+void CImageBrowserApp::OpenPath(const std::wstring& path) {
+    if (path.empty() || !provider_) return;
+
+    CJPEGImage* old = image_;
+    image_ = nullptr;
+    if (old) provider_->ClearRequest(old);
+    provider_->ClearAllRequests();
+    if (fileList_) {
+        delete fileList_;
+        fileList_ = nullptr;
+    }
+
+    wchar_t full[MAX_PATH] = {0};
+    if (!GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr)) return;
+    CString p(full);
+    DWORD attr = GetFileAttributesW(full);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) p += _T("\\");
+    // 字母序（FS_FileName）+ 升序，与“←→ 按字母序切图”一致
+    fileList_ = new CFileList(p, *watcher_, Helpers::FS_FileName, true, true);
+    fileList_->SetNavigationMode(Helpers::NM_LoopDirectory);
+    ShowImage(CJPEGProvider::FORWARD);
 }
 
 CProcessParams CImageBrowserApp::BuildProcessParams(bool keepView) {
@@ -418,8 +430,6 @@ void CImageBrowserApp::ShowImage(CJPEGProvider::EReadAheadDirection dir, int fra
         zoomMult_ = zoomStep_;
         interacting_ = false;
         zooming_ = false;
-        alphaChecked_ = false;
-        imageHasAlpha_ = false;
         animNextTick_ = 0.0;
         KillTimer(hwnd_, kSettleTimerId);
         showZoom_ = false;
@@ -635,35 +645,12 @@ void CImageBrowserApp::ComputeLayout(CSize& full, CSize& clip, CPoint& targetOff
     }
 }
 
-// 背景：棋盘用 pattern brush，纯色用 solid brush，都走 GDI。
+// 背景：alpha 模式铺纯浅灰，底色模式铺 ini 里的颜色，都走 solid brush。
+// 原来 alpha 模式铺棋盘花纹，图像透明的那圈边缘会被花纹衬成一块“填充色块”，
+// 看着像把透明边填成了实体，所以取消花纹。
 HBRUSH CImageBrowserApp::BackgroundBrush() {
-    if (checker_) {
-        if (!checkerBrush_) {
-            const int cell = 12;
-            BITMAPINFO bi{};
-            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bi.bmiHeader.biWidth = cell * 2;
-            bi.bmiHeader.biHeight = -cell * 2;
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB;
-            void* bits = nullptr;
-            HBITMAP tile = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-            if (tile && bits) {
-                DWORD* px = (DWORD*)bits;
-                for (int y = 0; y < cell * 2; y++) {
-                    for (int x = 0; x < cell * 2; x++) {
-                        bool dark = (x / cell) ^ (y / cell);
-                        px[y * cell * 2 + x] = dark ? 0xFFCCCCCC : 0xFFF0F0F0;
-                    }
-                }
-                checkerBrush_ = CreatePatternBrush(tile);
-            }
-            if (tile) DeleteObject(tile);
-        }
-        return checkerBrush_;
-    }
-    COLORREF c = RGB((cfgBackground_ >> 16) & 0xFF, (cfgBackground_ >> 8) & 0xFF, cfgBackground_ & 0xFF);
+    COLORREF c = checker_ ? RGB(0xF2, 0xF2, 0xF2)
+        : RGB((cfgBackground_ >> 16) & 0xFF, (cfgBackground_ >> 8) & 0xFF, cfgBackground_ & 0xFF);
     if (!solidBrush_ || solidColor_ != c) {
         if (solidBrush_) DeleteObject(solidBrush_);
         solidBrush_ = CreateSolidBrush(c);
@@ -680,6 +667,11 @@ void CImageBrowserApp::FillBackgroundArea(HDC dc, int x, int y, int w, int h) {
     FillRect(dc, &r, BackgroundBrush());
 }
 
+COLORREF CImageBrowserApp::BackgroundColor() const {
+    if (checker_) return RGB(0xF2, 0xF2, 0xF2);
+    return RGB((cfgBackground_ >> 16) & 0xFF, (cfgBackground_ >> 8) & 0xFF, cfgBackground_ & 0xFF);
+}
+
 bool CImageBrowserApp::EnsureSurface(int w, int h) {
     if (memDC_ && surfaceW_ == w && surfaceH_ == h) return true;
     ReleaseSurface();
@@ -688,7 +680,7 @@ bool CImageBrowserApp::EnsureSurface(int w, int h) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;   // top-down
+    bi.bmiHeader.biHeight = -h;      // top-down
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -714,37 +706,31 @@ void CImageBrowserApp::ReleaseSurface() {
     surfaceW_ = surfaceH_ = 0;
 }
 
-
-// 内核给的 BGRA 带 alpha 直接合成到不透明画布；整行不透明时走 memcpy
-void CImageBrowserApp::BlendToSurface(const BYTE* src, int sw, int sh, int dx, int dy) {
-    if (!surfaceBits_ || sw <= 0 || sh <= 0) return;
-    if (dy < 0) { src += (size_t)(-dy) * (size_t)sw * 4; sh += dy; dy = 0; }
-    if (dx < 0) { src += (size_t)(-dx) * 4; sw += dx; dx = 0; }
-    if (dx + sw > surfaceW_) sw = surfaceW_ - dx;
-    if (dy + sh > surfaceH_) sh = surfaceH_ - dy;
-    if (sw <= 0 || sh <= 0) return;
+// 合成到已铺好的底色上：透明像素保留底色，半透明正常混合，输出 alpha=255
+void CImageBrowserApp::BlendToSurface(const BYTE* src, int stride, int sw, int sh, int dx, int dy) {
+    if (!surfaceBits_ || stride <= 0 || sw <= 0 || sh <= 0) return;
+    int x0 = 0, y0 = 0, w = sw, h = sh;
+    if (dy < 0) { y0 = -dy; h += dy; dy = 0; }
+    if (dx < 0) { x0 = -dx; w += dx; dx = 0; }
+    if (dx + w > surfaceW_) w = surfaceW_ - dx;
+    if (dy + h > surfaceH_) h = surfaceH_ - dy;
+    if (w <= 0 || h <= 0) return;
     BYTE* dstBase = (BYTE*)surfaceBits_ + (size_t)dy * surfaceW_ * 4 + (size_t)dx * 4;
-    for (int y = 0; y < sh; y++) {
-        const BYTE* s = src + (size_t)y * sw * 4;
+    for (int y = 0; y < h; y++) {
+        const BYTE* s = src + (size_t)(y0 + y) * (size_t)stride * 4 + (size_t)x0 * 4;
         BYTE* d = dstBase + (size_t)y * surfaceW_ * 4;
-        int x = 0;
-        while (x < sw) {
-            if (s[3] == 255) {
-                size_t run = 0;
-                while (x + (int)run < sw && s[run * 4 + 3] == 255) run++;
-                memcpy(d + (size_t)x * 4, s + (size_t)x * 4, run * 4);
-                x += (int)run;
-                continue;
+        for (int x = 0; x < w; x++) {
+            int a = s[x * 4 + 3];
+            if (a == 255) {
+                d[x * 4 + 0] = s[x * 4 + 0];
+                d[x * 4 + 1] = s[x * 4 + 1];
+                d[x * 4 + 2] = s[x * 4 + 2];
+            } else if (a != 0) {
+                d[x * 4 + 0] = (BYTE)((s[x * 4 + 0] * a + d[x * 4 + 0] * (255 - a)) / 255);
+                d[x * 4 + 1] = (BYTE)((s[x * 4 + 1] * a + d[x * 4 + 1] * (255 - a)) / 255);
+                d[x * 4 + 2] = (BYTE)((s[x * 4 + 2] * a + d[x * 4 + 2] * (255 - a)) / 255);
             }
-            if (s[3] != 0) {
-                int a = s[3];
-                d[x * 4 + 0] = (BYTE)((s[0] * a + d[x * 4 + 0] * (255 - a)) / 255);
-                d[x * 4 + 1] = (BYTE)((s[1] * a + d[x * 4 + 1] * (255 - a)) / 255);
-                d[x * 4 + 2] = (BYTE)((s[2] * a + d[x * 4 + 2] * (255 - a)) / 255);
-                d[x * 4 + 3] = 255;
-            }
-            x++;
-            s += 4;
+            d[x * 4 + 3] = 255;
         }
     }
 }
@@ -756,75 +742,54 @@ void CImageBrowserApp::Paint() {
     int cw = (int)(rc.right - rc.left);
     int ch = (int)(rc.bottom - rc.top);
     if (cw <= 0 || ch <= 0) return;
+    if (!EnsureSurface(cw, ch)) return;
 
-    HDC hdc = GetDC(hwnd_);
-
-    if (!image_) {
-        FillBackgroundArea(hdc, 0, 0, cw, ch);
-        ReleaseDC(hwnd_, hdc);
-        return;
+    // 底：alpha 模式铺棋盘（透明标识），底色模式铺纯色
+    DWORD* p = (DWORD*)surfaceBits_;
+    int n = surfaceW_ * surfaceH_;
+    if (checker_) {
+        const int cell = 8;
+        const DWORD c1 = 0xFFFFFFFFu;      // 白
+        const DWORD c2 = 0xFFE6E6E6u;      // 浅灰格
+        for (int yy = 0; yy < surfaceH_; yy++) {
+            DWORD* row = p + (size_t)yy * surfaceW_;
+            int cy = (yy / cell) & 1;
+            for (int xx = 0; xx < surfaceW_; xx++) {
+                row[xx] = (((xx / cell) & 1) ^ cy) ? c2 : c1;
+            }
+        }
+    } else {
+        COLORREF c = BackgroundColor();
+        DWORD px = 0xFF000000u | ((DWORD)GetRValue(c) << 16) | ((DWORD)GetGValue(c) << 8) | (DWORD)GetBValue(c);
+        for (int i = 0; i < n; i++) p[i] = px;
     }
 
-    CSize full(0, 0), clip(0, 0);
-    CPoint targetOffset(0, 0), drawPos(0, 0);
-    ComputeLayout(full, clip, targetOffset, drawPos);
+    if (image_) {
+        CSize full(0, 0), clip(0, 0);
+        CPoint targetOffset(0, 0), drawPos(0, 0);
+        ComputeLayout(full, clip, targetOffset, drawPos);
 
-    // 与参考版一致：不开 HQ（PFLAG_HighQualityResampling）。内核无 HQ 标志时走
-    // CBasicProcessing::PointSample，只按可见区域取样，1.68 亿像素也是几毫秒。
-    EProcessingFlags flags = EProcessingFlags(PFLAG_None);
-    CImageProcessingParams procParams = NeutralProcParams();
-    void* pDIB = image_->GetDIB(full, clip, targetOffset, procParams, flags);
-    if (!pDIB) {
-        FillBackgroundArea(hdc, 0, 0, cw, ch);
-        ReleaseDC(hwnd_, hdc);
-        return;
-    }
-
-    // 3 通道（JPEG/BMP24 等）一定不透明；4 通道要看实际 alpha。
-    if (!alphaChecked_ || image_->IsAnimation()) {   // 动画每帧可能有无透明不一样
-        alphaChecked_ = true;
-        imageHasAlpha_ = false;
-        if (image_->OriginalChannels() >= 4) {
-            const BYTE* px = (const BYTE*)pDIB;
-            int n = clip.cx * clip.cy;
-            for (int i = 0; i < n; i++) {
-                if (px[i * 4 + 3] != 255) { imageHasAlpha_ = true; break; }
+        // 与参考版一致：不开 HQ（PFLAG_HighQualityResampling）。内核无 HQ 标志时走
+        // CBasicProcessing::PointSample，只按可见区域取样，1.68 亿像素也是几毫秒。
+        void* pDIB = image_->GetDIB(full, clip, targetOffset, NeutralProcParams(), EProcessingFlags(PFLAG_None));
+        int dibW = image_->DIBWidth();
+        int dibH = image_->DIBHeight();
+        if (pDIB && dibW > 0 && dibH > 0) {
+            int w = IMin(clip.cx, dibW);
+            int h = IMin(clip.cy, dibH);
+            if (w > 0 && h > 0) {
+                // 带 alpha 的图（PNG/GIF/WebP）按 alpha 合成到窗口底色上：透明像素保留底色，
+                // 半透明像素正常混合；不带 alpha 的图（JPEG/BMP）alpha 视作 255，原样贴。
+                BlendToSurface((const BYTE*)pDIB, clip.cx, w, h, drawPos.x, drawPos.y);
             }
         }
     }
-    // 不透明：和原版 DrawDIB32bppWithBlackBorders 一样，刷边条 + 一次
-    // SetDIBitsToDevice 直接贴窗口，不做逐像素合成，也不整窗刷棋盘。
-    bool mayAlpha = imageHasAlpha_;
-    if (!mayAlpha) {
-        int x = drawPos.x, y = drawPos.y, w = clip.cx, h = clip.cy;
-        FillBackgroundArea(hdc, 0, 0, x, ch);
-        FillBackgroundArea(hdc, x + w, 0, cw - (x + w), ch);
-        FillBackgroundArea(hdc, x, 0, w, y);
-        FillBackgroundArea(hdc, x, y + h, w, ch - (y + h));
 
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = clip.cx;
-        bi.bmiHeader.biHeight = -clip.cy;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        SetDIBitsToDevice(hdc, drawPos.x, drawPos.y, clip.cx, clip.cy,
-                          0, 0, 0, clip.cy, pDIB, &bi, DIB_RGB_COLORS);
-        if (showZoom_) DrawZoomText(hdc);
-        ReleaseDC(hwnd_, hdc);
-        return;
-    }
+    if (showZoom_) DrawZoomText(memDC_);
 
-    // 有透明：必须先铺底，再逐像素合成到内存面，最后整窗一次 BitBlt
-    if (!EnsureSurface(cw, ch)) {
-        ReleaseDC(hwnd_, hdc);
-        return;
-    }
-    FillBackgroundArea(memDC_, 0, 0, cw, ch);
-    BlendToSurface((const BYTE*)pDIB, clip.cx, clip.cy, drawPos.x, drawPos.y);
+    // 普通窗口：整窗一次 BitBlt
+    HDC hdc = GetDC(hwnd_);
     BitBlt(hdc, 0, 0, cw, ch, memDC_, 0, 0, SRCCOPY);
-    if (showZoom_) DrawZoomText(hdc);
     ReleaseDC(hwnd_, hdc);
 }
 double CImageBrowserApp::FitZoom() {
@@ -962,6 +927,15 @@ LRESULT CImageBrowserApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, ZoomTextRect(), FALSE);
             }
             return 0;
+
+        case WM_DROPFILES: {
+            // 从资源管理器拖进来的文件/文件夹：取第 1 个打开，其余忽略
+            HDROP drop = (HDROP)wp;
+            wchar_t file[MAX_PATH] = {0};
+            if (DragQueryFileW(drop, 0, file, MAX_PATH) > 0) OpenPath(file);
+            DragFinish(drop);
+            return 0;
+        }
 
         case WM_KEYDOWN:
             switch (wp) {
