@@ -7,6 +7,7 @@
 下载：[ImageBrowser.zip](ImageBrowser.zip)
 
 ---
+<div align="center">
 
 | 键 | 效果 |
 | --- | --- |
@@ -23,6 +24,8 @@
 | CTRL + 滚动| 缩放2倍率（ini配置可以修改）
 
 > ini 配置：保存最大化窗口、底色、背景模式（alpha/color）（仅限关闭exe写入ini）。
+
+</div>
 
 ---
 
