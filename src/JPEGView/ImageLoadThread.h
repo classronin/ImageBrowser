@@ -119,6 +119,8 @@ private:
 	void ProcessReadPSDRequest(CRequest * request);
 	void ProcessReadRAWRequest(CRequest * request);
 	void ProcessReadGDIPlusRequest(CRequest * request);
+	void ProcessReadICORequest(CRequest * request);
+	void ProcessReadORARequest(CRequest * request);
 	void ProcessReadWICRequest(CRequest* request);
 
 	static void SetFileDependentProcessParams(CRequest * request);

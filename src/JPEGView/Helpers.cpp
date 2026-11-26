@@ -775,6 +775,9 @@ EImageFormat GetImageFormat(LPCTSTR sFileName) {
 			return IF_QOI;
 		} else if (_tcsicmp(sEnding, _T("PSD")) == 0) {
 			return IF_PSD;
+		} else if (_tcsicmp(sEnding, _T("ORA")) == 0) {
+			// ImageBrowser: OpenRaster（ZIP）按扩展名认，内容里取 mergedimage.png
+			return IF_ORA;
 		} else if (IsInFileEndingList(CSettingsProvider::This().FilesProcessedByWIC(), sEnding)) {
 			return IF_WIC;
 		} else if (IsInFileEndingList(CSettingsProvider::This().FileEndingsRAW(), sEnding)) {

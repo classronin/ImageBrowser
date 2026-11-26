@@ -39,7 +39,7 @@ static const wchar_t* kIniName = L"ImageBrowser.ini";
 
 static const wchar_t* kExts[] = {
     L".jpg", L".jpeg", L".jpe", L".jfif", L".png", L".gif", L".webp",
-    L".bmp", L".tga", L".psd", L".qoi"
+    L".bmp", L".tga", L".psd", L".qoi", L".ico", L".ora"
 };
 
 static uint32_t ClampColor(uint32_t c) { return c & 0xFFFFFFu; }

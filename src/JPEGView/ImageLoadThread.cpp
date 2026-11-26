@@ -2,12 +2,15 @@
 #include "StdAfx.h"
 #include "ImageLoadThread.h"
 #include <gdiplus.h>
+#include <shlwapi.h>
+#include <vector>
 #include "JPEGImage.h"
 #include "MessageDef.h"
 #include "Helpers.h"
 #include "SettingsProvider.h"
 #include "ReaderBMP.h"
 #include "ReaderTGA.h"
+#include "ReaderORA.h"
 #include "BasicProcessing.h"
 #include "dcraw_mod.h"
 #include "TJPEGWrapper.h"
@@ -79,6 +82,9 @@ static EImageFormat GetImageFormat(LPCTSTR sFileName) {
 		return IF_QOI;
 	} else if (header[0] == '8' && header[1] == 'B' && header[2] == 'P' && header[3] == 'S') {
 		return IF_PSD;
+	} else if (header[0] == 0 && header[1] == 0 && (header[2] == 1 || header[2] == 2) && header[3] == 0) {
+		// ICO / CUR: 目录头 = reserved(2)=0, type(2)=1|2, count(2)
+		return IF_ICO;
 	}
 
 	// default fallback if no matches based on magic bytes
@@ -163,39 +169,52 @@ static CJPEGImage* ConvertGDIPlusBitmapToJPEGImage(Gdiplus::Bitmap* pBitmap, int
 	}
 	delete[] pDimensionIDs;
 
-	// If there is an alpha channel in the original file we must blit the image onto a background color offscreen
-	// bitmap first to achieve proper rendering.
+	// ImageBrowser 改动：原版在这里把带 alpha 的图先 DrawImage 到 32bppRGB 离屏位图上，
+	// 底下填 ColorTransparency() 的实色，alpha 就此被烘掉——GIF 因此永远不透明。
+	// 改成统一转到 PixelFormat32bppARGB 并逐行原样拷贝，alpha 交给外壳按 Tab（棋盘/底色）合成。
+	// GIF 的透明来自调色板透明索引，GDI+ 未必在 PixelFormat 里报 Alpha 位，所以 GIF 一律走 ARGB。
 	CJPEGImage* pJPEGImage = NULL;
 	Gdiplus::PixelFormat pixelFormat = pBitmap->GetPixelFormat();
-	bool bHasAlphaChannel = (pixelFormat & (PixelFormatAlpha | PixelFormatPAlpha));
-	Gdiplus::Bitmap* pBmTarget = NULL;
-	Gdiplus::Graphics* pBmGraphics = NULL;
-	Gdiplus::Bitmap* pBitmapToUse;
-	if (bHasAlphaChannel) {
-		pBmTarget = new Gdiplus::Bitmap(pBitmap->GetWidth(), pBitmap->GetHeight(), PixelFormat32bppRGB);
-		pBmGraphics = new Gdiplus::Graphics(pBmTarget);
-		COLORREF bkColor = CSettingsProvider::This().ColorTransparency();
-		Gdiplus::SolidBrush bkBrush(Gdiplus::Color(GetRValue(bkColor), GetGValue(bkColor), GetBValue(bkColor)));
-		pBmGraphics->FillRectangle(&bkBrush, 0, 0, pBmTarget->GetWidth(), pBmTarget->GetHeight());
-		pBmGraphics->DrawImage(pBitmap, 0, 0, pBmTarget->GetWidth(), pBmTarget->GetHeight());
-		pBitmapToUse = pBmTarget;
-		if (pBmGraphics->GetLastStatus() == Gdiplus::OutOfMemory) {
+	bool bHasAlphaChannel = (pixelFormat & (PixelFormatAlpha | PixelFormatPAlpha)) != 0;
+	bool bKeepAlpha = bHasAlphaChannel || eImageFormat == IF_GIF;
+	int nWidth = (int)pBitmap->GetWidth();
+	int nHeight = (int)pBitmap->GetHeight();
+
+	Gdiplus::Bitmap* pArgbBitmap = NULL;
+	Gdiplus::Bitmap* pBitmapToUse = pBitmap;
+	if (bKeepAlpha) {
+		pArgbBitmap = new Gdiplus::Bitmap(nWidth, nHeight, PixelFormat32bppARGB);
+		Gdiplus::Graphics argbGraphics(pArgbBitmap);
+		argbGraphics.DrawImage(pBitmap, 0, 0, nWidth, nHeight);
+		if (argbGraphics.GetLastStatus() == Gdiplus::OutOfMemory) {
 			isOutOfMemory = true;
-			delete pBmGraphics; delete pBmTarget;
+			delete pArgbBitmap;
 			return NULL;
 		}
-	} else {
-		pBitmapToUse = pBitmap;
+		pBitmapToUse = pArgbBitmap;
 	}
 
-	Gdiplus::Rect bmRect(0, 0, pBitmap->GetWidth(), pBitmap->GetHeight());
+	Gdiplus::Rect bmRect(0, 0, nWidth, nHeight);
 	Gdiplus::BitmapData bmData;
-	lastStatus = pBitmapToUse->LockBits(&bmRect, Gdiplus::ImageLockModeRead, PixelFormat32bppRGB, &bmData);
+	lastStatus = pBitmapToUse->LockBits(&bmRect, Gdiplus::ImageLockModeRead,
+		bKeepAlpha ? PixelFormat32bppARGB : PixelFormat32bppRGB, &bmData);
 	if (lastStatus == Gdiplus::Ok) {
-		assert(bmData.PixelFormat == PixelFormat32bppRGB);
-		void* pDIB = CBasicProcessing::ConvertGdiplus32bppRGB(bmRect.Width, bmRect.Height, bmData.Stride, bmData.Scan0);
+		void* pDIB = NULL;
+		if (bKeepAlpha && bmData.PixelFormat == PixelFormat32bppARGB) {
+			uint32* pNewDIB = new(std::nothrow) uint32[(size_t)nWidth * nHeight];
+			if (pNewDIB != NULL) {
+				const uint8* pSrc = (const uint8*)bmData.Scan0;
+				for (int j = 0; j < nHeight; j++) {
+					memcpy(pNewDIB + (size_t)j * nWidth, pSrc + (size_t)j * bmData.Stride, (size_t)nWidth * 4);
+				}
+				pDIB = pNewDIB;
+			}
+		} else {
+			assert(bmData.PixelFormat == PixelFormat32bppRGB);
+			pDIB = CBasicProcessing::ConvertGdiplus32bppRGB(bmRect.Width, bmRect.Height, bmData.Stride, bmData.Scan0);
+		}
 		if (pDIB != NULL) {
-			pJPEGImage = new CJPEGImage(bmRect.Width, bmRect.Height, pDIB, pEXIFData, 4, nJPEGHash, eImageFormat,
+			pJPEGImage = new CJPEGImage(nWidth, nHeight, pDIB, pEXIFData, 4, nJPEGHash, eImageFormat,
 				eImageFormat == IF_GIF && nFrameCount > 1, nFrameIndex, nFrameCount, nFrameTimeMs);
 		}
 		pBitmapToUse->UnlockBits(&bmData);
@@ -203,14 +222,119 @@ static CJPEGImage* ConvertGDIPlusBitmapToJPEGImage(Gdiplus::Bitmap* pBitmap, int
 		isOutOfMemory = true;
 	}
 
-	if (pBmGraphics != NULL && pBmTarget != NULL) {
-		delete pBmGraphics;
-		delete pBmTarget;
+	if (pArgbBitmap != NULL) {
+		delete pArgbBitmap;
 	}
 
 	pBitmap->GetLastStatus(); // reset status
 
 	return pJPEGImage;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+// ICO / CUR
+//
+// 一个 .ico 里有多种尺寸（256/128/64/48/32/16 …）。GDI+ 的 Bitmap(file) 对 ICO 自己挑一张，
+// 不保证是最大的，所以这里自己读目录项：按像素面积选最大那张作为"原图"，缩放交给内核，
+// 与 PNG 走同一条路径，窗口尺寸变化时不换图。alpha 原样保留（由外壳按 Tab 合成）。
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct SIconDirEntry {
+	BYTE bWidth, bHeight, bColorCount, bReserved;
+	WORD wPlanes, wBitCount;
+	DWORD dwBytesInRes, dwImageOffset;
+};
+static_assert(sizeof(SIconDirEntry) == 16, "ICONDIRENTRY must be 16 bytes");
+
+static int IconEntryWidth(const SIconDirEntry& entry) { return entry.bWidth == 0 ? 256 : entry.bWidth; }
+static int IconEntryHeight(const SIconDirEntry& entry) { return entry.bHeight == 0 ? 256 : entry.bHeight; }
+
+// 大尺寸 ICO 条目是 PNG 载荷，直接借 GDI+ 解 PNG，再拷成 BGRA（alpha 保留）。
+// 解码实现与 ORA 共用一份：CReaderORA::DecodePngMemory
+static uint32* DecodeIconPng(const BYTE* pPng, size_t nPngSize, int& nWidth, int& nHeight) {
+	return CReaderORA::DecodePngMemory(pPng, nPngSize, nWidth, nHeight);
+}
+
+// 传统条目是 DIB：BITMAPINFOHEADER + 调色板 + XOR 位图 + AND 掩码（高度是两段之和）
+static uint32* DecodeIconDib(const BYTE* pData, size_t nDataSize, int& nWidth, int& nHeight) {
+	if (nDataSize < sizeof(BITMAPINFOHEADER)) {
+		return NULL;
+	}
+	const BITMAPINFOHEADER* pBih = (const BITMAPINFOHEADER*)pData;
+	if (pBih->biCompression != BI_RGB) {
+		return NULL;
+	}
+	int w = (int)pBih->biWidth;
+	int nDibHeight = (int)pBih->biHeight;
+	int h = (nDibHeight < 0 ? -nDibHeight : nDibHeight) / 2;
+	int nBpp = (int)pBih->biBitCount;
+	if (w <= 0 || h <= 0 || w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
+		return NULL;
+	}
+	if (nBpp != 1 && nBpp != 4 && nBpp != 8 && nBpp != 24 && nBpp != 32) {
+		return NULL;
+	}
+
+	size_t nPaletteColors = (nBpp <= 8) ? (size_t)(pBih->biClrUsed ? pBih->biClrUsed : (1 << nBpp)) : 0;
+	const BYTE* pPalette = pData + sizeof(BITMAPINFOHEADER);
+	const BYTE* pXor = pPalette + nPaletteColors * 4;
+	int nXorStride = ((w * nBpp + 31) / 32) * 4;
+	int nAndStride = ((w + 31) / 32) * 4;
+	const BYTE* pAnd = pXor + (size_t)nXorStride * h;
+	size_t nNeeded = (size_t)(pAnd - pData) + (size_t)nAndStride * h;
+	if (nNeeded > nDataSize) {
+		return NULL;
+	}
+
+	uint32* pPixels = new(std::nothrow) uint32[(size_t)w * h];
+	if (pPixels == NULL) {
+		return NULL;
+	}
+
+	bool bAnyAlpha = false;
+	for (int y = 0; y < h; y++) {
+		const BYTE* pSrcRow = pXor + (size_t)(h - 1 - y) * nXorStride;
+		uint32* pDstRow = pPixels + (size_t)y * w;
+		for (int x = 0; x < w; x++) {
+			uint32 pixel;
+			if (nBpp == 32) {
+				memcpy(&pixel, pSrcRow + (size_t)x * 4, 4);
+				if ((pixel & 0xFF000000u) != 0) {
+					bAnyAlpha = true;
+				}
+			} else if (nBpp == 24) {
+				pixel = 0xFF000000u | ((uint32)pSrcRow[x * 3 + 2] << 16) | ((uint32)pSrcRow[x * 3 + 1] << 8) | pSrcRow[x * 3];
+			} else {
+				int nIndex;
+				if (nBpp == 8) {
+					nIndex = pSrcRow[x];
+				} else if (nBpp == 4) {
+					nIndex = (pSrcRow[x / 2] >> ((x & 1) ? 0 : 4)) & 0x0F;
+				} else {
+					nIndex = (pSrcRow[x / 8] >> (7 - (x & 7))) & 0x01;
+				}
+				const BYTE* pEntry = pPalette + (size_t)nIndex * 4;
+				pixel = 0xFF000000u | ((uint32)pEntry[2] << 16) | ((uint32)pEntry[1] << 8) | pEntry[0];
+			}
+			pDstRow[x] = pixel;
+		}
+	}
+
+	// 透明来自 AND 掩码（1 = 透明）。32bpp 自带 alpha 时按 alpha 走，全 0 才退回掩码
+	if (!(nBpp == 32 && bAnyAlpha)) {
+		for (int y = 0; y < h; y++) {
+			const BYTE* pMaskRow = pAnd + (size_t)(h - 1 - y) * nAndStride;
+			uint32* pDstRow = pPixels + (size_t)y * w;
+			for (int x = 0; x < w; x++) {
+				bool bTransparent = ((pMaskRow[x / 8] >> (7 - (x & 7))) & 0x01) != 0;
+				pDstRow[x] = bTransparent ? (pDstRow[x] & 0x00FFFFFFu) : (pDstRow[x] | 0xFF000000u);
+			}
+		}
+	}
+
+	nWidth = w;
+	nHeight = h;
+	return pPixels;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////
@@ -315,6 +439,22 @@ void CImageLoadThread::ProcessRequest(CRequestBase& request) {
 			DeleteCachedJxlDecoder();
 			DeleteCachedAvifDecoder();
 			ProcessReadTGARequest(&rq);
+			break;
+		case IF_ICO:
+			DeleteCachedGDIBitmap();
+			DeleteCachedWebpDecoder();
+			DeleteCachedPngDecoder();
+			DeleteCachedJxlDecoder();
+			DeleteCachedAvifDecoder();
+			ProcessReadICORequest(&rq);
+			break;
+		case IF_ORA:
+			DeleteCachedGDIBitmap();
+			DeleteCachedWebpDecoder();
+			DeleteCachedPngDecoder();
+			DeleteCachedJxlDecoder();
+			DeleteCachedAvifDecoder();
+			ProcessReadORARequest(&rq);
 			break;
 		case IF_WEBP:
 			DeleteCachedGDIBitmap();
@@ -1040,6 +1180,79 @@ void CImageLoadThread::ProcessReadRAWRequest(CRequest * request) {
 	if (bOutOfMemory) {
 		request->OutOfMemory = true;
 	}
+}
+
+void CImageLoadThread::ProcessReadICORequest(CRequest * request) {
+	std::vector<BYTE> data;
+	FILE* fptr = _tfopen(request->FileName, _T("rb"));
+	if (fptr == NULL) {
+		return;
+	}
+	fseek(fptr, 0, SEEK_END);
+	long nFileSize = ftell(fptr);
+	fseek(fptr, 0, SEEK_SET);
+	if (nFileSize > 0 && nFileSize <= 64L * 1024 * 1024) {
+		data.resize((size_t)nFileSize);
+		if (fread(data.data(), 1, (size_t)nFileSize, fptr) != (size_t)nFileSize) {
+			data.clear();
+		}
+	}
+	fclose(fptr);
+
+	if (data.size() < 6 || (data[2] != 1 && data[2] != 2) || data[3] != 0) { // type: 1=ICO, 2=CUR
+		return;
+	}
+	int nCount = data[4] | (data[5] << 8);
+	if (nCount <= 0 || data.size() < (size_t)(6 + 16 * nCount)) {
+		return;
+	}
+
+	// 选像素面积最大的一张；面积相同取位深更高的
+	int nBest = -1;
+	for (int i = 0; i < nCount; i++) {
+		const SIconDirEntry& entry = *(const SIconDirEntry*)(data.data() + 6 + 16 * i);
+		if ((size_t)entry.dwImageOffset + entry.dwBytesInRes > data.size()) {
+			continue;
+		}
+		if (nBest < 0) {
+			nBest = i;
+			continue;
+		}
+		const SIconDirEntry& best = *(const SIconDirEntry*)(data.data() + 6 + 16 * nBest);
+		int nArea = IconEntryWidth(entry) * IconEntryHeight(entry);
+		int nBestArea = IconEntryWidth(best) * IconEntryHeight(best);
+		if (nArea > nBestArea || (nArea == nBestArea && entry.wBitCount > best.wBitCount)) {
+			nBest = i;
+		}
+	}
+	if (nBest < 0) {
+		return;
+	}
+
+	const SIconDirEntry& entry = *(const SIconDirEntry*)(data.data() + 6 + 16 * nBest);
+	const BYTE* pPayload = data.data() + entry.dwImageOffset;
+	size_t nPayloadSize = entry.dwBytesInRes;
+
+	int nWidth = 0;
+	int nHeight = 0;
+	uint32* pPixels = NULL;
+	// 大尺寸条目是 PNG 载荷（\x89PNG），其余是 DIB
+	if (nPayloadSize > 8 && pPayload[0] == 0x89 && pPayload[1] == 'P' && pPayload[2] == 'N' && pPayload[3] == 'G') {
+		pPixels = DecodeIconPng(pPayload, nPayloadSize, nWidth, nHeight);
+	} else {
+		pPixels = DecodeIconDib(pPayload, nPayloadSize, nWidth, nHeight);
+	}
+	if (pPixels == NULL) {
+		return;
+	}
+
+	request->Image = new CJPEGImage(nWidth, nHeight, pPixels, NULL, 4, 0, IF_ICO, false, 0, 1, 0);
+}
+
+void CImageLoadThread::ProcessReadORARequest(CRequest * request) {
+	bool bOutOfMemory = false;
+	request->Image = CReaderORA::ReadImage(request->FileName, bOutOfMemory);
+	request->OutOfMemory = request->Image == NULL && bOutOfMemory;
 }
 
 void CImageLoadThread::ProcessReadGDIPlusRequest(CRequest * request) {

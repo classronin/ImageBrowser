@@ -35,6 +35,7 @@ set(JPEGVIEW_SOURCES
   ${JPEGVIEW_DIR}/QOIWrapper.cpp
   ${JPEGVIEW_DIR}/ReaderBMP.cpp
   ${JPEGVIEW_DIR}/ReaderTGA.cpp
+  ${JPEGVIEW_DIR}/ReaderORA.cpp
   ${JPEGVIEW_DIR}/ResizeFilter.cpp
   ${JPEGVIEW_DIR}/SettingsProvider.cpp
   ${JPEGVIEW_DIR}/TJPEGWrapper.cpp

@@ -46,6 +46,8 @@ enum EImageFormat {
 	IF_CameraRAW,
 	IF_JPEG_Embedded, // JPEG embedded in another file, e.g. camera raw
 	IF_TGA,
+	IF_ICO, // ImageBrowser: ICO / CUR，取文件内像素最多的一张，alpha 保留
+	IF_ORA, // ImageBrowser: OpenRaster(ZIP)，显示 mergedimage.png，alpha 保留
 	IF_Unknown
 };
 
